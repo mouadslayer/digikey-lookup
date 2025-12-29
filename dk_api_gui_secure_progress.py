@@ -4,6 +4,7 @@ import json
 import os
 import csv
 import time
+import threading
 import requests
 import base64
 from datetime import datetime
@@ -24,7 +25,7 @@ DELAY_BETWEEN_CALLS = 0.25
 
 
 # ---------------- Encryption ----------------
-def load_key():
+def load_cipher():
     os.makedirs(APP_DIR, exist_ok=True)
     if not os.path.exists(KEY_FILE):
         key = Fernet.generate_key()
@@ -126,7 +127,7 @@ class DigiKeyGUI:
         self.remember = tk.BooleanVar()
         self.input_csv = tk.StringVar()
 
-        self.cipher = load_key()
+        self.cipher = load_cipher()
         self.load_config()
         self.build_ui()
 
@@ -140,10 +141,10 @@ class DigiKeyGUI:
         creds.pack(fill="x", pady=10)
 
         ttk.Label(creds, text="Client ID").grid(row=0, column=0, sticky="w")
-        ttk.Entry(creds, textvariable=self.client_id, width=60).grid(row=0, column=1, pady=2)
+        ttk.Entry(creds, textvariable=self.client_id, width=60).grid(row=0, column=1)
 
         ttk.Label(creds, text="Client Secret").grid(row=1, column=0, sticky="w")
-        ttk.Entry(creds, textvariable=self.client_secret, show="*", width=60).grid(row=1, column=1, pady=2)
+        ttk.Entry(creds, textvariable=self.client_secret, show="*", width=60).grid(row=1, column=1)
 
         ttk.Checkbutton(
             creds,
@@ -169,7 +170,6 @@ class DigiKeyGUI:
     def log_msg(self, msg):
         self.log.insert(tk.END, msg + "\n")
         self.log.see(tk.END)
-        self.root.update_idletasks()
 
     def pick_input(self):
         path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
@@ -196,6 +196,7 @@ class DigiKeyGUI:
                 self.client_secret.set(creds.get("client_secret", ""))
                 self.remember.set(True)
 
+    # ---------- Thread-safe run ----------
     def run(self):
         if not all([self.client_id.get(), self.client_secret.get(), self.input_csv.get()]):
             messagebox.showerror("Missing data", "Client ID, Client Secret and Input CSV are required.")
@@ -205,47 +206,71 @@ class DigiKeyGUI:
         self.progress["value"] = 0
         self.log.delete("1.0", tk.END)
 
-        self.save_config()
+        threading.Thread(target=self.run_worker, daemon=True).start()
 
-        input_path = self.input_csv.get()
-        input_dir = os.path.dirname(input_path)
-        output_path = os.path.join(
-            input_dir,
-            f"output_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        )
+    def run_worker(self):
+        try:
+            self.save_config()
 
-        with open(input_path, newline="", encoding="utf-8-sig") as f:
-            rows = list(csv.DictReader(f))
+            input_path = self.input_csv.get()
+            input_dir = os.path.dirname(input_path)
+            output_path = os.path.join(
+                input_dir,
+                f"output_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            )
 
-        self.progress["maximum"] = len(rows)
+            with open(input_path, newline="", encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
 
-        token_mgr = DigiKeyTokenManager(self.client_id.get(), self.client_secret.get())
+            total = len(rows)
+            self.root.after(0, lambda: self.progress.config(maximum=total))
 
-        with open(output_path, "w", newline="", encoding="utf-8") as f_out:
-            writer = csv.DictWriter(f_out, fieldnames=["Input_PN", "MFR", "MPN", "Status"])
-            writer.writeheader()
+            token_mgr = DigiKeyTokenManager(
+                self.client_id.get(),
+                self.client_secret.get()
+            )
 
-            for i, row in enumerate(rows, 1):
-                pn = row.get("Input_PN", "").strip()
-                self.log_msg(f"[{i}/{len(rows)}] {pn}")
+            with open(output_path, "w", newline="", encoding="utf-8") as f_out:
+                writer = csv.DictWriter(
+                    f_out,
+                    fieldnames=["Input_PN", "MFR", "MPN", "Status"]
+                )
+                writer.writeheader()
 
-                try:
-                    token = token_mgr.get_token()
-                    mfr, mpn, status = fetch_part(pn, token, self.client_id.get())
-                except Exception:
-                    mfr = mpn = ""
-                    status = "EXCEPTION"
+                for i, row in enumerate(rows, 1):
+                    pn = row.get("Input_PN", "").strip()
 
-                writer.writerow({
-                    "Input_PN": pn,
-                    "MFR": mfr,
-                    "MPN": mpn,
-                    "Status": status
-                })
+                    self.root.after(0, lambda p=pn, i=i, t=total:
+                        self.log_msg(f"[{i}/{t}] Looking up {p}")
+                    )
 
-                self.progress["value"] = i
-                time.sleep(DELAY_BETWEEN_CALLS)
+                    try:
+                        token = token_mgr.get_token()
+                        mfr, mpn, status = fetch_part(pn, token, self.client_id.get())
+                    except Exception:
+                        mfr = mpn = ""
+                        status = "EXCEPTION"
 
+                    writer.writerow({
+                        "Input_PN": pn,
+                        "MFR": mfr,
+                        "MPN": mpn,
+                        "Status": status
+                    })
+
+                    self.root.after(0, lambda i=i:
+                        self.progress.config(value=i)
+                    )
+
+                    time.sleep(DELAY_BETWEEN_CALLS)
+
+            self.root.after(0, lambda: self.finish(output_path))
+
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+            self.root.after(0, lambda: self.run_btn.config(state="normal"))
+
+    def finish(self, output_path):
         self.run_btn.config(state="normal")
         self.log_msg(f"\nDone! Output saved to:\n{output_path}")
         messagebox.showinfo("Completed", f"Output file created:\n{output_path}")
@@ -256,3 +281,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     DigiKeyGUI(root)
     root.mainloop()
+
